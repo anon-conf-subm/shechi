@@ -1,0 +1,299 @@
+import time
+
+from numpy.create import zeros, loadtxt
+
+from sequre.attributes import sequre
+
+from sequre.utils.testing import assert_eq_approx
+from sequre.constants import mpc_uint
+from sequre.utils.io import read_vector, read_matrix
+from sequre.types.sharetensor import Sharetensor
+
+from sequre.types.internal import Internal as sq
+from sequre.stdlib.lin_alg import orthonormalize
+
+from sequre.stdlib.learn.pca import random_pca_with_norm, random_pca_without_projection
+from utils.param import *
+from utils.data_sharing import shares_paths
+
+from sequre.types.multiparty_union import MPU
+
+
+def merge_masks(major_mask, minor_mask):
+    new_mask = major_mask.copy()
+
+    ind = 0
+    for j in range(len(major_mask)):
+        if new_mask[j]:
+            new_mask[j] = bool(minor_mask[ind])
+            ind += 1
+    
+    return new_mask
+
+
+def open_input_files(mpc):
+    _, pheno_path, _ = shares_paths(mpc, 'gwas', 'pheno')
+    _, cov_path, _ = shares_paths(mpc, 'gwas', 'cov')
+    _, geno_mask_path, geno_path = shares_paths(mpc, 'gwas', 'geno')
+    _, miss_mask_path, miss_path = shares_paths(mpc, 'gwas', 'miss')
+    
+    return (open(pheno_path),
+            open(cov_path),
+            open(geno_path),
+            open(miss_path),
+            open(geno_mask_path),
+            open(miss_mask_path))
+
+
+def load_snp_positions(modulus):
+    snp_pos = []
+    with open(SNP_POS_FILE) as f:
+        for _, line in zip(range(NUM_SNPS), f):
+            chrom, pos = line.split()
+            snp_pos.append(mpc_uint(int(chrom.strip()) * 10 ** 9 + int(pos.strip())))
+    
+    return Sharetensor(
+        snp_pos, snp_pos, snp_pos.zeros(), modulus, snp_pos.zeros(),
+        snp_pos.zeros(), False, True, False)
+
+
+def load_phenotypes_and_covariates(mpc, f_pheno, f_cov, modulus):
+    pheno = read_vector(f_pheno, NUM_INDS, True, TP=mpc_uint)
+    cov = read_matrix(f_cov, NUM_INDS, NUM_COVS, True, TP=mpc_uint)
+    pheno_x_r, pheno_r = mpc.arithmetic.__beaver_partition(pheno, modulus)
+    cov_x_r, cov_r = mpc.arithmetic.__beaver_partition(cov, modulus)
+
+    return (
+        load_snp_positions(modulus),
+        Sharetensor(
+            pheno, pheno_x_r, pheno_r, modulus, list[mpc_uint](),
+            list[mpc_uint](), False, False, False),
+        Sharetensor(
+            cov, cov_x_r, cov_r, modulus, list[list[mpc_uint]](),
+            list[list[mpc_uint]](), False, False, False))
+
+
+def locus_distance_filter(snp_pos):
+    selected = [0 for _ in range(len(snp_pos))]  # 1 selected, 0 unselected, -1 TBD
+
+    prev = -1
+    for i in range(len(selected)):
+        if (prev < 0) or (snp_pos.share[i] - prev > LD_DIST_THRES):
+            selected[i] = 1
+            prev = int(snp_pos.share[i])
+    
+    return selected
+
+
+@sequre
+def load_dosage(mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+                imask, jmask, rows, cols, modulus):
+    g = Sharetensor.read_filtered_matrix(
+        mpc, f_geno, f_geno_mask, imask, jmask,
+        rows, cols, 0, 3, modulus, True)
+    miss = Sharetensor.read_filtered_matrix(
+        mpc, f_miss, f_miss_mask, imask, jmask,
+        rows, cols, 0, 1, modulus, True)[0]
+    dosage = g[1] + g[2] * 2
+
+    return g, miss, dosage
+
+
+@sequre
+def missing_rates_filter(mpc, num_inds, num_snps, snp_pos, pheno, cov, geno, miss, dosage):
+    snp_keep = [mpc_uint(1) for _ in range(num_snps)]
+    ind_keep = [mpc_uint(1) for _ in range(num_inds)]
+    filtered_miss = miss
+    filtered_dosage = dosage
+
+    if SKIP_QC:
+        print(f"CP{mpc.pid}:\tSkipped 1st and 2nd QC.")
+        return snp_pos, pheno, cov, filtered_miss, filtered_dosage, ind_keep, snp_keep
+    
+    snp_keep = sq.reveal_to_all(mpc, miss.sum() < int(num_inds * GMISS_UB)).share
+    snp_pos = snp_pos.filter(snp_keep)
+    print(f"CP{mpc.pid}:\t1st QC filtering done. "
+          f"Number of selected SNPs: {len(snp_pos)}.")
+
+    m = int(snp_keep.sum())
+    imiss = miss.T.filter(snp_keep).sum()
+    ihet = geno[1].T.filter(snp_keep).sum()
+
+    m1_obs = m - imiss
+    ihet = ihet.to_fp()
+    ind_keep = sq.reveal_to_all(
+        mpc,
+        (imiss < int(m * IMISS_UB)) *
+        (ihet < m1_obs * HET_UB) *
+        (ihet > m1_obs * HET_LB)).share
+
+    pheno = pheno.filter(ind_keep)
+    cov = cov.filter(ind_keep)
+    filtered_miss = miss.filter(ind_keep).T.filter(snp_keep).T
+    filtered_dosage = dosage.filter(ind_keep).T.filter(snp_keep).T
+    
+    print(f"CP{mpc.pid}:\t2nd QC filtering done. "
+          f"Number of selected individuals: {len(pheno)}.")
+    
+    return snp_pos, pheno, cov, filtered_miss, filtered_dosage, ind_keep, snp_keep
+
+
+@sequre
+def hwe_filter(mpc, snp_pos, pheno, geno, miss, dosage, ind_keep, snp_keep, geno_variance, maf):
+    gkeep = [bool(e) for e in snp_keep]
+    snp_keep_2 = snp_pos.raw_ones()
+    
+    if SKIP_QC:
+        print(f"CP{mpc.pid}:\tSkipped 3rd QC.")
+        return gkeep, snp_pos, maf, geno_variance
+
+    filtered_g = [e.filter(ind_keep).T.filter(snp_keep).T for e in geno]
+    ctrl = 1 - pheno
+    gmiss_ctrl = (ctrl.expand_dims() @ miss)[0]
+    dosage_sum_ctrl = (ctrl.expand_dims() @ dosage)[0]
+    g_count_ctrl = [(ctrl.expand_dims() @ e)[0] for e in filtered_g]
+    dosage_tot_ctrl = (-gmiss_ctrl + ctrl.sum()) * 2
+    maf_ctrl = dosage_sum_ctrl / dosage_tot_ctrl
+    Maf_ctrl = 1 - maf_ctrl
+    g_exp_ctrl = [
+        Maf_ctrl * Maf_ctrl * dosage_tot_ctrl / 2,
+        Maf_ctrl * maf_ctrl * dosage_tot_ctrl,
+        maf_ctrl * maf_ctrl * dosage_tot_ctrl / 2]
+
+    hwe_chisq = [((e.to_fp() - g_exp_ctrl[i]) ** 2) / g_exp_ctrl[i] for i, e in enumerate(g_count_ctrl)].sum()
+    snp_keep_2 = sq.reveal_to_all(
+        mpc,
+        (maf < MAF_UB) *
+        (maf > MAF_LB) *
+        (hwe_chisq < HWE_UB)).share
+
+    geno_variance.filter(snp_keep_2)
+    maf = maf.filter(snp_keep_2)
+    snp_pos = snp_pos.filter(snp_keep_2)
+    gkeep = merge_masks(gkeep, snp_keep_2)
+
+    print(f"CP{mpc.pid}:\t3rd QC filtering done. "
+          f"Number of selected SNPs: {len(snp_pos)}.")
+    
+    return gkeep, snp_pos, maf, geno_variance
+
+
+@sequre
+def quality_control(mpc, num_inds, num_snps, snp_pos, pheno, cov, geno, miss, dosage):
+    snp_pos, pheno, cov, miss, dosage, ind_keep, snp_keep = missing_rates_filter(
+        mpc, num_inds, num_snps, snp_pos, pheno, cov, geno, miss, dosage)
+    
+    gmiss = miss.sum()
+    dosage_sum = dosage.sum()
+    maf = dosage_sum / ((len(pheno) - gmiss) * 2)
+    geno_variance = (maf * (1 - maf))
+
+    gkeep, snp_pos, maf, geno_variance = hwe_filter(
+        mpc, snp_pos, pheno, geno, miss, dosage, ind_keep, snp_keep, geno_variance, maf)
+
+    geno_std_inv = 1 / sq.sqrt(mpc, geno_variance)
+    geno_mean = maf * 2
+
+    return snp_pos, pheno, cov, geno_mean, geno_std_inv, ind_keep, gkeep
+
+
+def linkage_disequilibrium_filter(mpc, snp_pos, miss, dosage, geno_mean, geno_std_inv, ind_keep, gkeep):
+    selected_snps = locus_distance_filter(snp_pos)
+    snp_keep_mask = merge_masks(gkeep, selected_snps)
+
+    filtered_miss = miss.filter(ind_keep).T.filter(snp_keep_mask).T
+    filtered_dosage = dosage.filter(ind_keep).T.filter(snp_keep_mask).T
+    filtered_geno_mean = geno_mean.filter(selected_snps)
+    filtered_geno_std_inv = geno_std_inv.filter(selected_snps)
+    
+    print(f"CP{mpc.pid}:\tPCA filtering done. Number of selected SNPs: {snp_keep_mask.to_int().sum()}.")
+    return filtered_miss, filtered_dosage, filtered_geno_mean, filtered_geno_std_inv
+
+
+@sequre
+def psa_with_norm(mpc, top_components, oversampling_count, power_iterations,
+        snp_pos, cov, geno_mean, geno_std_inv, ind_keep, gkeep, miss, dosage):
+    
+    miss, dosage, geno_mean, geno_std_inv = linkage_disequilibrium_filter(
+        mpc, snp_pos, miss, dosage, geno_mean, geno_std_inv, ind_keep, gkeep)
+    
+    U, Z = random_pca_with_norm(
+        mpc, dosage, miss, geno_mean, geno_std_inv, top_components,
+        oversampling_count, power_iterations, len(snp_pos))
+    
+    print(f"CP{mpc.pid}:\tSelected {top_components} eigenvectors.")
+    proj = U @ Z
+    proj.extend(cov.T.to_fp())
+    return orthonormalize(mpc, proj)
+
+
+@sequre
+def cochran_armitage(mpc, V, pheno, dosage):
+    pheno_int = pheno.expand_dims()
+    pheno_float = pheno_int.to_fp()
+    dosage_float = dosage.astype(float)
+    p_hat = pheno_float - pheno_int @ V.T @ V
+    sp = p_hat.sum(axis=1)[0]
+    sx = ((1 - V.T.sum(axis=0).expand_dims() @ V) @ dosage_float)[0]
+    spp = sq.dot(mpc, p_hat[0], axis=0)
+    sxp = (p_hat @ dosage_float)[0]
+    sxx = (dosage * dosage).sum(axis=0).to_fp() - sq.dot(mpc, V @ dosage_float, axis=0)
+    norm_sp = sp / len(pheno)
+    numer = sxp - sx * norm_sp
+    denom = (sxx - sx * sx / len(pheno)) * (spp - sp * norm_sp)
+    assoc = numer / sq.sqrt(mpc, denom)
+
+    print(f"CP{mpc.pid}:\tComputed GWAS associations.")
+    return assoc
+
+
+def gwas_protocol(mpc, modulus):
+    (f_pheno, f_cov, f_geno, f_miss,
+     f_geno_mask, f_miss_mask) = open_input_files(mpc)
+    snp_pos, pheno, cov = load_phenotypes_and_covariates(mpc, f_pheno, f_cov, modulus)
+    g, miss, dosage = load_dosage(
+        mpc, f_geno, f_geno_mask, f_miss, f_miss_mask,
+        [mpc_uint(1) for _ in range(NUM_INDS)],
+        [mpc_uint(1) for _ in range(NUM_SNPS)],
+        NUM_INDS, NUM_SNPS, modulus)
+
+    (snp_pos, pheno, cov, g_mean, g_std_bern_inv,
+    ikeep, gwas_snp_keep_mask) = quality_control(
+        mpc, NUM_INDS, NUM_SNPS, snp_pos, pheno, cov, g, miss, dosage)
+    
+    components = psa_with_norm(mpc, PCA_COMPONENTS, PCA_OVERSAMPLES, PCA_POWER_ITERATIONS,
+            snp_pos, cov, g_mean, g_std_bern_inv, ikeep, gwas_snp_keep_mask, miss, dosage)
+    return cochran_armitage(mpc, components, pheno, dosage.filter(ikeep).T.filter(gwas_snp_keep_mask).T)
+
+
+@sequre
+def psa_without_norm(mpc, geno, cov, top_components, oversampling_count, power_iterations):
+    U = random_pca_without_projection(
+        mpc, geno, top_components,
+        oversampling_count, power_iterations)
+    print(f"CP{mpc.pid}:\tSelected {top_components} eigenvectors.")
+
+    if cov.shape[1] > 1:
+        U.extend(cov.T.to_fp())
+
+    return U.via_mpc(lambda stensor: orthonormalize(mpc, stensor))
+
+
+def gwas_without_norm(mpc, dosage, pheno, cov, pca_top_components_count, pca_oversampling_count, pca_power_iterations_count):
+    assert SKIP_QC, "Not implemented yet: GWAS QC without norm"
+
+    with time.timing(f"CP{mpc.pid}:\tGWAS PSA"):
+        bs = mpc.stats.bytes_sent
+        components = psa_without_norm(
+            mpc, dosage, cov, pca_top_components_count,
+            pca_oversampling_count, pca_power_iterations_count)
+        be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tGWAS PSA bytes sent: {be - bs}")
+    
+    with time.timing(f"CP{mpc.pid}:\tGWAS CA"):
+        bs = mpc.stats.bytes_sent
+        ca = cochran_armitage(mpc, components, pheno, dosage)
+        be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tGWAS CA bytes sent: {be - bs}")
+
+    return ca

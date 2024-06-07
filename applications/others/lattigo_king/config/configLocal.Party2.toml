@@ -1,0 +1,12 @@
+
+## Output and cache paths
+output_dir = "out/gwas-toy/party2"
+cache_dir = "cache/gwas-toy/party2"
+
+
+## relatives specific parameters
+simple_data_path = "../../data/king/1000_genomes_ph_3/partition_22.txt" #"notebooks/matrix.csv" #
+separator = ' '
+number_of_rows = 16
+number_of_columns = 145442
+starting_index = 0
