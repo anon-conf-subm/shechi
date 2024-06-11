@@ -1,6 +1,6 @@
 # Shechi
 
-Shechi is an end-to-end, statically compiled and performance engineered, Pythonic framework for building efficient multiparty homomorphic encryption (MHE) pipelines.
+Shechi is an end-to-end, statically compiled and performance-engineered Pythonic framework for building efficient multiparty homomorphic encryption (MHE) pipelines.
 
 ## Installation
 
@@ -22,7 +22,16 @@ curl -L https://github.com/anon-conf-subm/shechi/releases/download/Anon/shechi-l
 ```
 
 ## Benchmarks
+
+**Note:** Input data is generated at random because the original input data is proprietary.
+
 Run all benchmarks:
 ```bash
 CODON_DEBUG=lt scripts/run.sh -release benchmarks --local --jit --all
+```
+
+## Via docker
+Run all Shechi benchmarks via docker:
+```bash
+sudo docker run --mount type=bind,source=$(pwd)/results,destination=/sequre/results --security-opt label=disable -e "CODON_DEBUG=lt" -e --privileged --rm -t anonconfsubm/shechi:latest scripts/run.sh -release benchmarks --local --jit --all
 ```
