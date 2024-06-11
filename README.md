@@ -31,7 +31,7 @@ CODON_DEBUG=lt scripts/run.sh -release benchmarks --local --jit --all
 ```
 
 ## Via podman/docker
-Run all Shechi benchmarks via docker:
+Run all Shechi benchmarks via [docker](https://hub.docker.com/r/anonconfsubm/shechi):
 ```bash
 sudo podman run --mount type=bind,source=$(pwd)/results,destination=/sequre/results --security-opt label=disable -e "CODON_DEBUG=lt" -e --privileged --rm -t anonconfsubm/shechi:anon scripts/run.sh -release benchmarks --local --jit --all
 ```
