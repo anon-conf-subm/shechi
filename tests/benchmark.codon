@@ -1,0 +1,408 @@
+import toml
+import secure_operator
+
+from time import timing
+from datetime import datetime
+
+from numpy.create import array, zeros, zeros_like
+
+from perf import perf_timing, perf_print_stats
+
+from ..applications.credit_score import credit_score
+from ..applications.king import king
+from ..applications.gwas import gwas_without_norm
+
+import sequre.lattiseq.ckks as ckks
+
+from sequre.stdlib.lin_alg import l2, orthonormalize
+from sequre.stdlib.learn.pca import random_pca_without_projection
+from sequre.types.utils import double_to_fp
+from sequre.types.multiparty_partition import MPP
+from sequre.types.multiparty_union import MPU
+from sequre.types.sharetensor import Sharetensor
+from sequre.utils.utils import random_floats, random_ints
+from sequre.utils.testing import time_frame
+from sequre.constants import RUN_TOGGLES, ENC_DIAG
+from sequre.utils.io import log
+
+
+################################### Wrappers #####################################
+def mpc_wrapper(mpc, modulus):
+    log_path = "perf_mpc.txt"
+    factor = [float(i) for i in range(mpc.mhe.crypto_params.params.slots())]
+
+    with perf_timing(f"CP{mpc.pid}:\tMPC encryption", log_path=log_path):
+        stensor = Sharetensor.enc(mpc, factor, 1, modulus)
+    with perf_timing(f"CP{mpc.pid}:\tMPC add plain", log_path=log_path):
+        result = secure_operator.add(mpc, stensor, 3.0)
+    with perf_timing(f"CP{mpc.pid}:\tMPC add", log_path=log_path):
+        result = secure_operator.add(mpc, stensor, stensor)
+    with perf_timing(f"CP{mpc.pid}:\tMPC mul plain", log_path=log_path):
+        result = secure_operator.mul(mpc, stensor, 3.0)
+    with perf_timing(f"CP{mpc.pid}:\tMPC mul", log_path=log_path):
+        result = secure_operator.mul(mpc, stensor, stensor)
+    with perf_timing(f"CP{mpc.pid}:\tMPC rotation", log_path=log_path):
+        result = stensor[3:]
+        result.extend(stensor[:3])
+    with perf_timing(f"CP{mpc.pid}:\tMPC decryption", log_path=log_path):
+        stensor.reveal(mpc)
+    with perf_timing(f"CP{mpc.pid}:\tMPC to bits using positive", log_path=log_path):
+        result = secure_operator.gt(mpc, stensor, 0)
+
+def mhe_wrapper(mpc, modulus):
+    log_path = f"perf_mhe_CP{mpc.pid}.txt"
+    slots = mpc.mhe.crypto_params.params.slots()
+    with mpc.randomness.seed_switch(-1):
+        values = random_floats((slots,))
+    
+    if mpc.pid == 0:
+        print(f"CP{mpc.pid}:\tTrusted dealer is not required while benchmarking collective MHE operations.")
+        return
+    
+    ciphervector = mpc.mhe.enc_vector(values, T=ckks.Ciphertext)
+    initial_level = ciphervector[0].level()
+
+    mpc.mhe.crypto_params.evaluator.drop_level(ciphervector[0], initial_level - mpc.mhe.bootstrap_min_level - 1)
+    ciphertext_bootstrapped = ciphervector[0].copy()
+
+    with perf_timing(f"CP{mpc.pid}:\tCollective MHE bootstrap", prefix=f"\n{datetime.now()} | ", log_path=log_path):
+        mpc.mhe._collective_bootstrap(ciphertext_bootstrapped, -1)
+    with perf_timing(f"CP{mpc.pid}:\tCollective MHE decryption", log_path=log_path):
+        mpc.mhe.decrypt([ciphertext_bootstrapped], -1)
+    with perf_timing(f"CP{mpc.pid}:\tCollective MHE: MHE to MPC", log_path=log_path):
+        stensor = mpc.mhe.ciphervector_to_additive_share_vector([ciphertext_bootstrapped], slots, modulus, -1, dtype=float)
+    with perf_timing(f"CP{mpc.pid}:\tCollective MHE: MPC to MHE", log_path=log_path):
+        mpc.mhe.additive_share_vector_to_ciphervector(stensor, modulus, True, -1)
+    
+    ciphertext_bootstrapped = mpc.comms.broadcast_from(ciphertext_bootstrapped, mpc.comms.hub_pid)
+    boot_lvl = ciphertext_bootstrapped.level()
+
+    print(f"CP{mpc.pid}:\tMHE collective bootstrapping level (Bootstrapped level: {boot_lvl}. Initial level: {initial_level}. Reduced level: {ciphervector[0].level()})")
+
+def stdlib_builtin_wrapper(mpc, modulus):
+    rows_per_party_setups = [16, 64]
+    cols = 8192
+    
+    for rows_per_party in rows_per_party_setups:
+        rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+
+        with mpc.randomness.seed_switch(-1):
+            raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+        raw_data_partition = zeros_like(raw_data) if mpc.pid == 0 else raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+
+        with timing(f"CP{mpc.pid}:\tSequre A @ A.T"):
+            bs = mpc.stats.bytes_sent
+            sequre_data = Sharetensor.enc(mpc, raw_data)
+            mpc_matmul = secure_operator.matmul(mpc, sequre_data, sequre_data.T)
+            mpc_matmul.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSequre A @ A.T for shape {sequre_data.shape} bytes sent: {be - bs}")
+
+        with timing(f"CP{mpc.pid}:\tSequre L2"):
+            bs = mpc.stats.bytes_sent
+            sequre_data = Sharetensor.enc(mpc, raw_data)
+            mpc_distance = l2(mpc, sequre_data)
+            mpc_distance.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSequre L2 for shape {sequre_data.shape} bytes sent: {be - bs}")
+
+        with timing(f"CP{mpc.pid}:\tSheQi A @ A.T"):
+            bs = mpc.stats.bytes_sent
+            sheqi_data = MPU(mpc, raw_data_partition, "partition")
+            mhe_matmul = secure_operator.matmul(mpc, sheqi_data, sheqi_data.T)
+            mhe_matmul.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSheQi A @ A.T for shape {sheqi_data.shape} bytes sent: {be - bs}")
+
+        with timing(f"CP{mpc.pid}:\tSheQi L2"):
+            bs = mpc.stats.bytes_sent
+            sheqi_data = MPU(mpc, raw_data_partition, "partition")
+            mhe_distance = l2(mpc, sheqi_data)
+            mhe_distance.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSheQi L2 for shape {sheqi_data.shape} bytes sent: {be - bs}")
+    
+    rows_per_party = 4096
+    rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+    cols_setups = [32, 128]
+
+    for cols in cols_setups:
+        with mpc.randomness.seed_switch(-1):
+            raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+        raw_data_partition = zeros_like(raw_data) if mpc.pid == 0 else raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party]
+
+        with timing(f"CP{mpc.pid}:\tSheQi A.T @ A"):
+            bs = mpc.stats.bytes_sent
+            sheqi_data = MPU(mpc, raw_data_partition, "partition")
+            mhe_matmul = secure_operator.matmul(mpc, sheqi_data.T, sheqi_data)
+            mhe_matmul.encrypt()
+            mhe_matmul.reveal(mpc)
+            be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSheQi A.T @ A for shape {sheqi_data.shape} bytes sent: {be - bs}")
+
+    return sheqi_data
+
+def king_wrapper(mpc, modulus):
+    config = toml.read("applications/config/king.toml")
+
+    rows_per_partition = config.get("individuals_per_party", T=int)
+    rows = rows_per_partition * (mpc.comms.number_of_parties - 1)
+    cols = config.get("number_of_snps", T=int)
+    het_inv_scale = cols // 100
+    
+    # Generate data
+    with mpc.randomness.seed_switch(-1):
+        raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+    raw_data_partition = zeros_like(raw_data) if mpc.pid == 0 else raw_data[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    sequre_data = Sharetensor.enc(mpc, raw_data)
+    sheqi_data = MPP(mpc, raw_data_partition)
+    
+    # Upscale het_inv by het_inv_scale to reduce the impact of CKKS noise
+    raw_het_inv = array([[(1 / row.count(1)) for _ in range(rows)] for row in raw_data], dtype=float) * het_inv_scale
+    raw_het_inv_partition = zeros_like(raw_het_inv) if mpc.pid == 0 else raw_het_inv[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    sequre_het_inv = Sharetensor.enc(mpc, raw_het_inv)
+    sheqi_het_inv = MPP(mpc, raw_het_inv_partition)
+    
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tRaw KING for shape: {raw_data.shape}"):
+        classic_king_coefficients = king(mpc, raw_data, raw_het_inv)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}: Bytes sent raw king: {be - bs}")
+    log("", classic_king_coefficients.nan_to_num().tolist(), path=f'results/raw_king_CP{mpc.pid}_ind_{rows}_snps_{cols}.txt', mode='w', separator=' ')
+    
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tSequre KING for shape: {sequre_data.shape}"):
+        sequre_king_coefficients = king(mpc, sequre_data, sequre_het_inv)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}: Bytes sent Sequre king: {be - bs}")
+    log("", sequre_king_coefficients.reveal(mpc).tolist(), path=f'results/mpc_king_CP{mpc.pid}_ind_{rows}_snps_{cols}.txt', mode='w', separator=' ')
+    
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tSheQi KING for shape: {sheqi_data.shape}"):
+        sheqi_king_coefficients = king(mpc, sheqi_data, sheqi_het_inv)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}: Bytes sent SheQi king: {be - bs}")
+    log("", sheqi_king_coefficients.reveal(mpc).tolist(), path=f'results/mhe_king_CP{mpc.pid}_ind_{rows}_snps_{cols}.txt', mode='w', separator=' ')
+
+    return sheqi_king_coefficients
+
+def pca_wrapper(mpc, modulus):
+    def _project(mpc, components, data):
+        w = orthonormalize(mpc, components.reveal(mpc) @ data)
+        return (w @ data.T).T
+    
+    config = toml.read("applications/config/pca.toml")
+
+    rows_per_party = config.get("individuals_per_party", T=int)
+    rows = rows_per_party * (mpc.comms.number_of_parties - 1)
+    cols = config.get("number_of_snps", T=int)
+
+    top_components_count = config.get("top_components_count", T=int)
+    oversampling_count = config.get("oversampling_count", T=int)
+    power_iterations_count = config.get("power_iterations_count", T=int)
+    
+    # Generate data
+    with mpc.randomness.seed_switch(-1):
+        raw_data = array(random_ints((rows, cols), 0, 2), dtype=float)
+
+    # Scale data to avoid overflow
+    raw_data -= raw_data.mean(axis=0)
+    raw_data /= raw_data.shape[0]
+    
+    partition = raw_data[(mpc.pid - 1) * rows_per_party:mpc.pid * rows_per_party] if mpc.pid else raw_data.zeros()
+    mpc_data = Sharetensor.enc(mpc, raw_data, 0, modulus)
+    mp_data = MPU(mpc, partition, "partition")
+    
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing(f"CP{mpc.pid}:\tRaw PCA for shape {raw_data.shape}"):
+        bs = mpc.stats.bytes_sent
+        raw_y = random_pca_without_projection(
+            mpc, raw_data, top_components_count, oversampling_count,
+            power_iterations_count)
+        be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tRaw PCA bytes sent: {be - bs}")
+    
+    log("", raw_y.tolist(), path=f'results/raw_pca_components_CP{mpc.pid}_{rows}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
+    raw_projection = _project(mpc, raw_y, raw_data)
+    log("", raw_projection.tolist(), path=f'results/raw_pca_projection_CP{mpc.pid}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
+
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing(f"CP{mpc.pid}:\tSheQi PCA for shape {mp_data.shape}"):
+        bs = mpc.stats.bytes_sent
+        mp_y = random_pca_without_projection(
+            mpc, mp_data, top_components_count, oversampling_count,
+            power_iterations_count)
+        be = mpc.stats.bytes_sent
+        print(f"CP{mpc.pid}:\tSheQi PCA bytes sent: {be - bs}")
+    
+    log("", mp_y.reveal().tolist(), path=f'results/mhe_pca_components_CP{mpc.pid}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
+    mp_projection = _project(mpc, mp_y, raw_data)
+    log("", mp_projection.tolist(), path=f'results/mhe_pca_projection_CP{mpc.pid}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
+
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing(f"CP{mpc.pid}:\tSequre PCA for shape {mpc_data.shape}"):
+        bs = mpc.stats.bytes_sent
+        mpc_y = random_pca_without_projection(
+            mpc, mpc_data, top_components_count, oversampling_count,
+            power_iterations_count)
+        be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tSequre PCA bytes sent: {be - bs}")
+    
+    log("", mpc_y.reveal(mpc).tolist(), path=f'results/mpc_pca_components_CP{mpc.pid}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
+    mpc_projection = _project(mpc, mpc_y, raw_data)
+    log("", mpc_projection.tolist(), path=f'results/mpc_pca_projection_CP{mpc.pid}_ind_{cols}_snps_{cols}.txt', mode='w', separator=' ')
+
+    return raw_projection
+
+def gwas_wo_norm_wrapper(mpc, modulus):
+    config = toml.read("applications/config/gwas.toml")
+    
+    indv_per_party = config.get("individuals_per_party", T=int)
+    indv_count = indv_per_party * (mpc.comms.number_of_parties - 1)
+    cov_count = config.get("number_of_covariates", T=int)
+    pca_top_components_count = config.get("pca_components", T=int)
+    pca_oversampling_count = config.get("pca_oversampling", T=int)
+    pca_power_iterations_count = config.get("pca_power_iterations", T=int)
+    snps_count = config.get("number_of_snps", T=int)
+
+    # Generate data
+    with mpc.randomness.seed_switch(-1):
+        raw_dosage = array(random_ints((indv_count, snps_count), 0, 2), dtype=float)
+        raw_cov = array(random_ints((indv_count, cov_count), 0, 2), dtype=float)
+        raw_pheno = array(random_ints((indv_count,), 0, 1), dtype=float)
+    
+    raw_dosage -= raw_dosage.mean(axis=0)
+    raw_dosage /= len(raw_dosage)
+
+    def _get_partition(mpc, data, rows, cols):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows, cols))
+        return data[(mpc.pid - 1) * rows: mpc.pid * rows, :cols] if mpc.pid else dealer_data
+
+    def _get_partition_1_dim(mpc, data, rows):
+        dealer_data = zeros(((mpc.comms.number_of_parties - 1) * rows,))
+        return data[(mpc.pid - 1) * rows: mpc.pid * rows] if mpc.pid else dealer_data
+
+    mpc_dosage = Sharetensor.enc(mpc, raw_dosage, 0, modulus)
+    mpc_cov = Sharetensor.enc(mpc, raw_cov, 0, modulus)
+    mpc_pheno = Sharetensor.enc(mpc, raw_pheno, 0, modulus)
+    
+    partition_dosage = _get_partition(mpc, raw_dosage, indv_per_party, snps_count)
+    partition_cov = _get_partition(mpc, raw_cov, indv_per_party, cov_count)
+    partition_pheno = _get_partition_1_dim(mpc, raw_pheno, indv_per_party)
+    
+    mhe_dosage = MPU(mpc, partition_dosage, "partition")
+    mhe_cov = MPU(mpc, partition_cov, "partition")
+    mhe_pheno = MPU(mpc, partition_pheno, "partition").T
+
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing(f"CP{mpc.pid}:\tRaw GWAS without normalization for shape {raw_dosage.shape}"):
+        bs = mpc.stats.bytes_sent
+        raw_ca = gwas_without_norm(
+            mpc, raw_dosage, raw_pheno, raw_cov, pca_top_components_count,
+            pca_oversampling_count, pca_power_iterations_count)
+        be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tRaw GWAS without normalization bytes sent: {be - bs}")
+    
+    log("", raw_ca.nan_to_num().tolist(), path=f'results/raw_gwas_assoc_CP{mpc.pid}_ind_{indv_count}_snps_{snps_count}.txt', mode='w', separator=' ')
+
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing(f"CP{mpc.pid}\tMHE GWAS without normalization for shape {mhe_dosage.shape}"):
+        bs = mpc.stats.bytes_sent
+        mhe_ca = gwas_without_norm(
+            mpc, mhe_dosage, mhe_pheno, mhe_cov, pca_top_components_count,
+            pca_oversampling_count, pca_power_iterations_count)
+        be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tMHE GWAS without normalization bytes sent: {be - bs}")
+    
+    log("", mhe_ca.reveal(mpc).tolist(), path=f'results/mhe_gwas_assoc_CP{mpc.pid}_ind_{indv_count}_snps_{snps_count}.txt', mode='w', separator=' ')
+    
+    mpc.randomness.reset_seed(-1, hash('global'))
+    with timing(f"CP{mpc.pid}:\tMPC GWAS without normalization for shape {mpc_dosage.shape}"):
+        bs = mpc.stats.bytes_sent
+        mpc_ca = gwas_without_norm(
+            mpc, mpc_dosage, mpc_pheno, mpc_cov, pca_top_components_count,
+            pca_oversampling_count, pca_power_iterations_count)
+        be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tMPC GWAS without normalization bytes sent: {be - bs}")
+    
+    log("", mpc_ca.reveal(mpc).tolist(), path=f'results/mpc_gwas_assoc_CP{mpc.pid}_ind_{indv_count}_snps_{snps_count}.txt', mode='w', separator=' ')
+
+    return raw_ca
+
+def credit_score_wrapper(mpc, modulus):
+    config = toml.read("applications/config/credit_score.toml")
+
+    rows_per_partition = config.get("individuals_per_party", T=int)
+    rows = rows_per_partition * (mpc.comms.number_of_parties - 1)
+    feature_rank = config.get("number_of_features", T=int)
+
+    optimizer = config.get("optimizer", T=str)
+    loss = config.get("loss", T=str)
+    step_size = config.get("step_size", T=float)
+    momentum = config.get("momentum", T=float)
+    epochs = config.get("epochs", T=int)
+    verbose = bool(config.get("verbose", T=int))
+    
+    # Generate data
+    with mpc.randomness.seed_switch(-1):
+        raw_features = array(random_ints((rows, feature_rank)), dtype=float)
+        raw_labels = array(random_ints((rows, 1), 0, 1), dtype=float)
+    raw_labels = raw_labels * 2 - 1
+
+    raw_features_partition = zeros_like(raw_features) if mpc.pid == 0 else raw_features[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    raw_labels_partition = zeros_like(raw_labels) if mpc.pid == 0 else raw_labels[(mpc.pid - 1) * rows_per_partition:mpc.pid * rows_per_partition]
+    sequre_features = Sharetensor.enc(mpc, raw_features)
+    sequre_labels = Sharetensor.enc(mpc, raw_labels)
+    sheqi_features = MPU(mpc, raw_features_partition, "partition")
+    sheqi_labels = MPU(mpc, raw_labels_partition, "partition")
+    
+    mpc.randomness.reset_seed(-1, hash('global'))
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tRaw credit score for shape: {raw_features.shape}"):
+        credit_score(mpc, raw_features, raw_labels, optimizer, loss, step_size, epochs, momentum, verbose)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tBytes sent raw credit score: {be - bs}")
+    
+    mpc.randomness.reset_seed(-1, hash('global'))
+    bs = mpc.stats.bytes_sent
+    with timing(f"CP{mpc.pid}:\tSequre credit score for shape: {sequre_features.shape}"):
+        credit_score(mpc, sequre_features, sequre_labels, optimizer, loss, step_size, epochs, momentum, verbose)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tBytes sent Sequre credit score: {be - bs}")
+
+    mpc.randomness.reset_seed(-1, hash('global'))
+    bs = mpc.stats.bytes_sent
+    with mpc.default_encoding(ENC_DIAG), timing(f"CP{mpc.pid}:\tSheQi credit score for shape: {sequre_features.shape}"):
+        credit_score(mpc, sheqi_features, sheqi_labels, optimizer, loss, step_size, epochs, momentum, verbose)
+    be = mpc.stats.bytes_sent
+    print(f"CP{mpc.pid}:\tBytes sent SheQi credit score: {be - bs}")
+
+##################################################################################
+
+
+def benchmark[TP](mpc, benchmark_toggles: dict, modulus: TP):
+    h_mat = [[double_to_fp(float(i + j), modulus) for i in range(50)] for j in range(50)]
+    sv_mat = Sharetensor(h_mat, modulus)
+    sv_mat.get_partitions(mpc)
+    sv_mat.fp = True
+
+    mpc.comms.sync_parties()
+    run_all = benchmark_toggles[RUN_TOGGLES.RUN_ALL_FLAG]
+
+    if benchmark_toggles[RUN_TOGGLES.MHE_FLAG] or run_all:
+        time_frame(mpc, mhe_wrapper, 'MHE', modulus)
+    if benchmark_toggles[RUN_TOGGLES.MPC_TEST_FLAG] or run_all:
+        time_frame(mpc, mpc_wrapper, 'MPC', modulus)
+    if benchmark_toggles[RUN_TOGGLES.STDLIB_BUILTIN_TEST_FLAG] or run_all:
+        time_frame(mpc, stdlib_builtin_wrapper, 'Stdlib builtins', modulus)
+    if benchmark_toggles[RUN_TOGGLES.KING_FLAG] or run_all:
+        time_frame(mpc, king_wrapper, 'KING', modulus)
+    if benchmark_toggles[RUN_TOGGLES.PCA_FLAG] or run_all:
+        time_frame(mpc, pca_wrapper, 'PCA', modulus)
+
+    if benchmark_toggles[RUN_TOGGLES.GWAS_WO_NORM_FLAG] or run_all:
+        time_frame(mpc, gwas_wo_norm_wrapper, 'Genome-wide association study (without normalization)', modulus)
+    if benchmark_toggles[RUN_TOGGLES.CREDIT_SCORE_FLAG] or run_all:
+        time_frame(mpc, credit_score_wrapper, 'Credit score inference', modulus)
+
+    mpc.comms.sequential(perf_print_stats, False, f"CP{mpc.pid}: ")
