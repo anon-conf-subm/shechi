@@ -36,5 +36,5 @@ curl -L https://github.com/anon-conf-subm/shechi/releases/download/Anon/shechi-l
 
 Run all benchmarks:
 ```bash
-CODON_DEBUG=lt scripts/run.sh -release benchmarks --local --jit --all
+CODON_DEBUG=lt scripts/run.sh -release benchmarks --local --jit --stdlib-builtin --king --pca --gwas-without-norm
 ```
