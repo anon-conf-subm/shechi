@@ -13,5 +13,5 @@ sudo podman run --mount type=bind,source=$(pwd)/results,destination=/sequre/resu
 
 Or run the container in interactive mode to explore Shechi:
 ```bash
-sudo podman run --mount type=bind,source=$(pwd)/results,destination=/sequre/results --security-opt label=disable -e "CODON_DEBUG=lt" -e --privileged --rm -it anonconfsubm/shechi:anon /bin/bash
+sudo podman run --mount type=bind,source=$(pwd)/results,destination=/sequre/results --security-opt label=disable -e "CODON_DEBUG=lt" -e --privileged --rm -it anonconfsubm/shechi:latest /bin/bash
 ```
