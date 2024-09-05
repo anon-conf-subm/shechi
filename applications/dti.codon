@@ -1,0 +1,358 @@
+import prg
+
+from sequre.constants import mpc_uint, DEBUG
+from sequre.utils.io import read_matrix
+from sequre.utils.utils import zeros_mat
+from sequre.utils.stats import score_binary_classificator
+from sequre.types.utils import fp_to_double, double_to_fp
+from sequre.types.sharetensor import Sharetensor as Stensor
+from sequre.attributes import sequre
+from sequre.types.internal import InternalMPC
+
+from utils.param import *
+from utils.data_sharing import shares_paths
+
+
+def get_random_idx_generator(mpc, size):
+    l = list(range(size))
+    mpc.randomness.switch_seed(-1)
+    prg.shuffle(l)
+    mpc.randomness.restore_seed(-1)
+    for e in l: yield e
+
+
+def log_all(mpc, layers, size, X, y, W, b, dW, db, vW, vb):
+    if mpc.pid == 2: print('X')
+    X[:size, :size].reveal(mpc)
+    if mpc.pid == 2: print('y')
+    y[:size].reveal(mpc)
+    if mpc.pid == 2: print('W 0')
+    
+    for i in range(layers):
+        W[i][:size, :size].reveal(mpc)
+        if mpc.pid == 2: print('b', i)
+        b[i][:size].reveal(mpc)
+        if mpc.pid == 2: print('dW', i)
+        dW[i][:size, :size].reveal(mpc)
+        if mpc.pid == 2: print('db', i)
+        db[i][:size].reveal(mpc)
+        if mpc.pid == 2: print('vW', i)
+        vW[i][:size, :size].reveal(mpc)
+        if mpc.pid == 2: print('vb', i)
+        vb[i][:size].reveal(mpc)
+
+
+def open_input_files(mpc):
+    _, features_path, _ = shares_paths(mpc, 'dti', 'features')
+    _, labels_path, _ = shares_paths(mpc, 'dti', 'labels')
+    
+    return open(features_path), open(labels_path)
+
+
+def load_test_data(modulus):
+    with open('tests/data/dti/input/test_features.txt') as f:
+        x_matrix = []
+        
+        for line in f:
+            x_matrix.append([double_to_fp(float(int(e)), modulus) for e in line.split()])
+
+        data = Stensor(x_matrix, modulus)
+        data.public = True
+        data.fp = True
+
+        return data
+
+
+def load_X_y(mpc, X_shape, y_shape, modulus):
+    X = None
+    y = None
+
+    if mpc.pid == 0:
+        X = Stensor(zeros_mat(X_shape[0], X_shape[1]), modulus)
+        y = Stensor(zeros_mat(y_shape[0], y_shape[1]), modulus)
+    else:
+        fx, fy = open_input_files(mpc)
+        X = Stensor(read_matrix(fx, X_shape[0], X_shape[1], True, TP=mpc_uint), modulus)
+        y = Stensor(read_matrix(fy, y_shape[0], y_shape[1], True, TP=mpc_uint), modulus)
+        fx.close()
+        fy.close()
+
+    X.fp = True
+    y.fp = True
+      
+    return X, y
+
+
+def initialize_model(mpc, modulus):
+    W = []
+    dW = []
+    vW = []
+    b = []
+    db = []
+    vb = []
+
+    for l in range(N_HIDDEN + 1):
+        if (N_HIDDEN == 0 and l >= 1):
+            break
+        
+        W_layer_shape = (N_NEURONS, N_NEURONS)
+        b_layer_len = N_NEURONS
+
+        if (N_HIDDEN == 0 and l == 0):
+            W_layer_shape = (FEATURE_RANK, N_CLASSES - 1)
+            b_layer_len = N_CLASSES - 1
+        elif (l == 0):
+            W_layer_shape = (FEATURE_RANK, N_NEURONS)
+        elif (l == N_HIDDEN):
+            W_layer_shape = (N_NEURONS, N_CLASSES - 1)
+            b_layer_len = N_CLASSES - 1
+            
+        W_layer = InternalMPC.dist(mpc, W_layer_shape, 'normal', modulus, (0.0, 0.01))
+        b_layer = Stensor.zeros(b_layer_len, modulus)
+        b_layer.fp = True
+        
+        dW_layer = W_layer.zeros()
+        vW_layer = W_layer.zeros()
+    
+        db_layer = b_layer.zeros()
+        vb_layer = b_layer.zeros()
+
+        W.append(W_layer)
+        dW.append(dW_layer)
+        vW.append(vW_layer)
+        b.append(b_layer)
+        db.append(db_layer)
+        vb.append(vb_layer)
+     
+    return W, dW, vW, b, db, vb
+
+
+@sequre
+def forward_pass(mpc, data, weights, bias):
+    activations = []
+    relus = []
+    
+    for l in range(N_HIDDEN):
+        activation = (data if l == 0 else activations[l - 1]) @ weights[l] + bias[l]
+        # Apply ReLU non-linearity
+        relu = activation > 0
+        after_relu = activation * relu
+
+        # TODO: #110 Implement dropout.
+
+        activations.append(after_relu)
+        relus.append(relu)
+    
+    # Calculate scores and add bias term
+    scores = (data if N_HIDDEN == 0 else activations[-1]) @ weights[-1] + bias[-1]
+    
+    return activations, relus, scores
+
+
+@sequre
+def gradient_descent(mpc, X, y, W, b, dW, db, vW, vb):
+    act, relus, scores = forward_pass(mpc, X, W, b)
+
+    dscores = y.zeros()
+    if (LOSS == "hinge"):
+        y = y * 2 - 1
+        hinge_loss = 1 - y * scores
+        hinge_loss_reg = (hinge_loss > 0)
+        if DEBUG:
+            _loss = hinge_loss * hinge_loss_reg
+            print(f"CP{mpc.pid}:\t\tTraining loss: {_loss.reveal(mpc).flatten().sum()}")
+        dscores = y * hinge_loss_reg
+    else:
+        dscores = y - scores
+    dscores = dscores / len(X)
+
+    # Back propagation
+    dhidden = -dscores
+    for l in range(N_HIDDEN, -1, -1):
+        # Compute derivative of weights
+        dW[l] = (X.T if l == 0 else act.pop().T) @ dhidden
+        # Add regularization term to weights
+        if REG != 0.0: dW[l] = dW[l] + W[l] * REG
+        # Compute derivative of biases
+        db[l] = dhidden.sum()
+        # Compute backpropagated activations and apply derivative of ReLU
+        if l > 0: dhidden = dhidden @ W[l].T * relus.pop()
+
+    if DEBUG:
+        assert len(act) == 0
+        assert len(relus) == 0
+
+    # Update the model using Nesterov momentum
+    # Compute constants that update various parameters
+    for l in range(N_HIDDEN + 1):
+        # Update the weights
+        vW_prev = vW[l].copy()
+        # TODO: #117 Implement clever joint truncations pattern matcher
+        # vW[l] = vW[l] * MOMENTUM - dW[l] * LEARN_RATE
+        # W[l] = W[l] + vW[l] * (MOMENTUM + 1) - vW_prev * MOMENTUM
+        vW[l] = (vW[l].__no_trunc_mul(MOMENTUM) - dW[l].__no_trunc_mul(LEARN_RATE)).trunc(mpc.fp)
+        W[l] = W[l] + (vW[l].__no_trunc_mul(MOMENTUM + 1) - vW_prev.__no_trunc_mul(MOMENTUM)).trunc(mpc.fp)
+        
+        # Update the biases
+        vb_prev = vb[l].copy()
+        # TODO: #117 Implement clever joint truncations pattern matcher
+        # vb[l] = vb[l] * MOMENTUM - db[l] * LEARN_RATE
+        # b[l] = b[l] + vb[l] * (MOMENTUM + 1) - vb_prev * MOMENTUM
+        vb[l] = (vb[l].__no_trunc_mul(MOMENTUM) - db[l].__no_trunc_mul(LEARN_RATE)).trunc(mpc.fp)
+        b[l] = b[l] + (vb[l].__no_trunc_mul(MOMENTUM + 1) - vb_prev.__no_trunc_mul(MOMENTUM)).trunc(mpc.fp)
+    
+    return W, b, dW, db, vW, vb
+    
+
+def train_model(mpc, X, y, W, b, dW, db, vW, vb):    
+    # Round down number of batches in file
+    batches_in_file = len(X) // NN_BATCH_SIZE
+    epoch = 0
+
+    while True:
+        mpc.randomness.freeze_seed(-1)
+        prg.shuffle(X)
+        mpc.randomness.unfreeze_seed(-1)
+        prg.shuffle(y)
+        mpc.randomness.restore_seed(-1)
+
+        for i in range(batches_in_file):
+            X_batch = X[i * NN_BATCH_SIZE : (i + 1) * NN_BATCH_SIZE]
+            y_batch = y[i * NN_BATCH_SIZE : (i + 1) * NN_BATCH_SIZE]
+            
+            # Do one round of mini-batch gradient descent
+            if mpc.pid == 2: print(f"Epoch: {epoch}/{MAX_EPOCHS}")
+            W, b, dW, db, vW, vb = gradient_descent(
+                mpc, X_batch, y_batch,
+                W, b, dW, db, vW, vb)
+
+            # Update reference to training epoch
+            epoch += 1
+            if epoch >= MAX_EPOCHS:
+                return W, b
+    
+
+def dti_mpc_protocol(mpc, modulus, run_predictions = True):
+    # Initialize model and data structures
+    print(f"CP{mpc.pid}:\tInitializing model ...")
+    W, dW, vW, b, db, vb = initialize_model(mpc, modulus)
+
+    # Initialize data matrices
+    X, y = load_X_y(mpc, [N_FILE_BATCH, FEATURE_RANK], [N_FILE_BATCH, N_CLASSES - 1], modulus)
+    # Do gradient descent over multiple training epochs
+    W, b = train_model(mpc, X, y, W, b, dW, db, vW, vb)
+
+    if mpc.pid > 0:
+        for l in range(N_HIDDEN + 1):
+            W_out_revealed = mpc.comms.reveal(W[l].share, modulus)
+            W_out = fp_to_double(W_out_revealed, modulus)
+            b_out_revealed = mpc.comms.reveal(b[l].share, modulus)
+            b_out = fp_to_double(b_out_revealed, modulus)
+            
+            if mpc.pid == 2:
+                with open(f'results/drug_target_interaction_inference_results_weights_layer_{l}.txt', 'w') as fw, \
+                        open(f'results/drug_target_interaction_inference_results_bias_layer_{l}.txt', 'w') as fb:
+                    for row in W_out:
+                        fw.write(' '.join([str(e) for e in row]))
+                        fw.write('\n')
+                    fb.write(' '.join([str(e) for e in b_out]))
+                    fw.write('\n')
+    
+    if run_predictions:
+        # TODO: #163 Organize files in whole project.
+        return forward_pass(mpc, load_test_data(modulus), W, b)[-1]
+    
+    return W[0].zeros()
+
+
+from numpy.create import array, zeros_like
+
+from sequre.stdlib.learn.neural_net.layers import Input, Dense
+from sequre.stdlib.learn.neural_net.model import Sequential
+from sequre.types.multiparty_union import MPU
+
+
+def dti_mhe_protocol(mpc):
+    sample_size_per_party = 64
+    sample_size = (mpc.comms.number_of_parties - 1) * sample_size_per_party
+    sample_test_size_per_party = 16
+    sample_test_size = (mpc.comms.number_of_parties - 1) * sample_test_size_per_party
+
+    n_neurons = 128
+    feature_rank = 8192
+    output_size = 1
+    step_size = 0.2
+    momentum = 0.9
+    epochs = 50
+    batch_size = 16
+    optimizer = "bgd"
+    loss = "hinge"
+
+    print(f"CP{mpc.pid}:\tMHE DTI: loading data ...")
+    with open("tests/data/dti/input/features.txt") as fx, open("tests/data/dti/input/labels.txt") as fy:
+        raw_X = read_matrix(fx, sample_size, FEATURE_RANK, False, TP=float)
+        raw_y = read_matrix(fy, sample_size, output_size, False, TP=float)
+    
+    with open("tests/data/dti/input/test_features.txt") as fx, open("tests/data/dti/input/test_labels.txt") as fy:
+        raw_test_X = read_matrix(fx, sample_test_size, FEATURE_RANK, False, TP=float)
+        raw_test_y = read_matrix(fy, sample_test_size, output_size, False, TP=float)
+    
+    if len(raw_X) > sample_size:
+        raw_X = raw_X[:sample_size]
+        raw_y = raw_y[:sample_size]
+
+    if len(raw_test_X) > sample_test_size:
+        raw_test_X = raw_test_X[:sample_test_size]
+        raw_test_y = raw_test_y[:sample_test_size]
+    
+    if feature_rank != FEATURE_RANK:
+        raw_X = raw_X.pad(sample_size, feature_rank)
+        raw_test_X = raw_test_X.pad(sample_size, feature_rank)
+
+    print(f"CP{mpc.pid}:\tMHE DTI: shuffling data ...")
+    mpc.randomness.freeze_seed(-1)
+    prg.shuffle(raw_X)
+    mpc.randomness.unfreeze_seed(-1)
+    prg.shuffle(raw_y)
+    mpc.randomness.restore_seed(-1)
+
+    np_X = array(raw_X)
+    np_y = array(raw_y) * 2 - 1
+    np_test_X = array(raw_test_X)
+
+    # # Plain
+    # X = np_X
+    # y = np_y
+    # test_X = np_test_X
+    
+    # MPU
+    print(f"CP{mpc.pid}:\tMHE DTI: partitioning data ...")
+    X_partition = zeros_like(np_X) if mpc.pid == 0 else np_X[(mpc.pid - 1) * sample_size_per_party:mpc.pid * sample_size_per_party]
+    y_partition = zeros_like(np_y) if mpc.pid == 0 else np_y[(mpc.pid - 1) * sample_size_per_party:mpc.pid * sample_size_per_party]
+    test_X_partition = zeros_like(np_test_X) if mpc.pid == 0 else np_test_X[(mpc.pid - 1) * sample_test_size_per_party:mpc.pid * sample_test_size_per_party]
+    X = MPU(mpc, X_partition, "partition")
+    y = MPU(mpc, y_partition, "partition")
+    test_X = MPU(mpc, test_X_partition, "partition")
+    
+    layers = (
+        Input[type(X)](feature_rank),
+        Dense[type(X)]("relu", n_neurons, "normal", "zeros"),
+        Dense[type(X)]("linear", output_size, "normal", "zeros"))
+    
+    print(f"CP{mpc.pid}:\tMHE DTI: compiling sequential model ...")
+    model = Sequential(layers).compile(mpc, loss=loss, optimizer=optimizer)
+    
+    print(f"CP{mpc.pid}:\tMHE DTI: training sequential model ...")
+    model.fit(mpc, X=X, y=y, step=step_size, epochs=epochs, momentum=momentum, batch_size=batch_size)
+    
+    loss = model.get_loss(mpc, X, y).reveal().sum()
+    print(f"CP{mpc.pid}:\tMHE DTI final training loss: {loss}")
+
+    prediction = model.predict(mpc, test_X).reveal(mpc)
+    accuracy, precision, recall, f1 = score_binary_classificator(prediction.flatten().tolist(), raw_test_y.flatten().astype(int) * 2 - 1)
+    print(
+        f"CP{mpc.pid}:\tMHE DTI accuracy stats:\n"
+        f"\t\tAccuracy: {accuracy}.\n"
+        f"\t\tPrecision: {precision}.\n"
+        f"\t\tRecall: {recall}.\n"
+        f"\t\tF1: {f1}.\n")
