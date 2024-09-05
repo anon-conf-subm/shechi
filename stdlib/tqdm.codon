@@ -1,0 +1,4 @@
+def tqdm(mpc, iterable, desc):
+    for i, e in enumerate(iterable):
+        print(f"CP{mpc.pid}:\t{desc}: {i + 1}/{len(iterable)}")
+        yield e
