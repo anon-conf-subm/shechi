@@ -6,11 +6,7 @@ Shechi is an end-to-end, statically compiled and performance-engineered Pythonic
 
 **Note:** Input data is generated at random because the original input data is proprietary.
 
-Run all Shechi benchmarks via [docker](https://hub.docker.com/r/anonconfsubm/shechi):
-```bash
-sudo docker run --mount type=bind,source=$(pwd)/results,destination=/sequre/results --security-opt label=disable -e "CODON_DEBUG=lt" -e --privileged --rm -t anonconfsubm/shechi:anon scripts/run.sh -release benchmarks --local --jit --stdlib-builtin --king --pca --gwas-without-norm
-```
-or podman:
+Run all Shechi benchmarks via [podman or docker](https://hub.docker.com/r/anonconfsubm/shechi)):
 ```bash
 sudo podman run --mount type=bind,source=$(pwd)/results,destination=/sequre/results --security-opt label=disable -e "CODON_DEBUG=lt" -e --privileged --rm -t anonconfsubm/shechi:anon scripts/run.sh -release benchmarks --local --jit --stdlib-builtin --king --pca --gwas-without-norm
 ```
